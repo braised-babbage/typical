@@ -13,6 +13,7 @@
 
 ;;; Types
 
+
 ;;; A type is one of the following:
 ;;;    - a type variable (a non-null symbol)
 ;;;    - an arrow (-> t1 t2) where t1,t2 are types
@@ -91,11 +92,140 @@ substitution."
   (intern (format nil "~a~d" prefix (incf *variable-count*))))
 
 
+;;; Helper functions, used for managing
+;;;   - substitutions (mapping type variables to types)
+;;;   - type contexts (mapping variables to type schemes)
+
+(defun lookup (env var)
+  (let ((binding (assoc var env)))
+    (when binding
+      (cdr binding))))
+
+(defun extend (env vars vals)
+  (if (listp vars)
+      (pairlis vars vals env)
+      (acons vars vals env)))
+
+
+(defun mappend (fn list)
+  "Append the results of calling fn on each element of list.
+  Like mapcon, but uses append instead of nconc."
+  (apply #'append (mapcar fn list)))
+
+
+
+;;; Terms
+;;; A term in our language is one of the following:
+;;;   - variable (a non-null symbol)
+
+;;;   - lambda term (lambda (x) body)
+;;;     where x is a variable and body is a term
+(defun lambda-var (expr)
+  (first (second expr)))
+(defun lambda-body (expr)
+  (third expr))
+
+;;;   - let term (let ((x e)) body)
+;;;      where x is a variable, e is a term, and body is a term
+(defun let-binding (expr)
+  (first (second expr)))
+(defun let-body (expr)
+  (third expr))
+(defun let-var (expr)
+  (first (let-binding expr)))
+(defun let-val (expr)
+  (second (let-binding expr)))
+
+;;;   - an application (e f)
+;;;     where e,f are terms
+(defun application-op (expr)
+  (first expr))
+(defun application-arg (expr)
+  (second expr))
+
+
+;;; A type context is a mapping from variable terms to type schemes,
+;;; represented as an alist. The following lifts the substitution
+;;; operation to contexts.
+
+(defun substitute-all (subst context)
+  "Return a new type context, with the given substitution applied
+pointwise to all of the type schemes."
+  (mapcar #'(lambda (binding)
+	      (let* ((var (car binding))
+		     (scm (cdr binding))
+		     (bound (type-scheme-vars scm))
+		     (new-type (substitute-types subst (type-scheme-type scm))))
+		; assumes bound variables don't appear in subst
+		(cons var (make-type-scheme :vars bound :type new-type))))
+	  context))
+
+;;; There are two natural ways to get a type scheme from a type.
+;;; The simplest is to consider the type scheme with no quantified variables.
+;;; For the inference algorithm, we also need the following:
+
+(defun gen-scheme (type &optional (context nil))
+  "Given a type and a type context, construct type scheme which quantifies
+any free variables of the type which are not free in the context."
+  (let ((env-free (loop for (var . scheme) in context
+		     appending (free-variables (type-scheme-type scheme)))))
+    (make-type-scheme :vars (set-difference (free-variables type) env-free)
+		      :type type)))
+
+
+;;; Algorithm W
+
+
+(defun principal-substitution (context term type &optional (subst nil))
+  "Given a type context, a term, and a type, constructs a substitution 
+   under which the type is a 'principal type scheme' for the term with respect
+   to the type context."
+  (if (symbolp term)
+      (principal-substitution-variable context term type subst)
+      (case (first term)
+	(LAMBDA (principal-substitution-lambda context (lambda-var term) (lambda-body term) type subst))
+	(LET    (principal-substitution-let context (let-var term) (let-val term) (let-body term) type subst))
+	(otherwise (principal-substitution-application context (application-op term) (application-arg term) type subst)))))
+
+(defun principal-substitution-variable (context var type subst)
+  (let ((scheme (lookup context var)))
+    (if scheme
+	(unify (new-instance scheme) type subst)
+	(error "undefined: ~a" var))))
+
+(defun principal-substitution-application (context op arg type subst)
+  (let* ((a (make-type-variable))
+	 (subst2 (principal-substitution context op (list '-> a type) subst)))
+    (principal-substitution context arg a subst2)))
+
+(defun principal-substitution-lambda (context var body type subst)
+  (let* ((a (make-type-variable))
+	 (b (make-type-variable))
+	 (subst2 (unify type (list '-> a b) subst))
+	 (context2 (extend context var (make-type-scheme :type a))))
+    (principal-substitution context2 body b subst2)))
+
+(defun principal-substitution-let (context var val body type subst)
+  (let* ((a (make-type-variable))
+	 (subst2 (principal-substitution context val a subst))
+	 (context2 (extend context
+			   var
+			   (gen-scheme (substitute-types subst2 type)
+				       (substitute-all subst2 context)))))
+    (principal-substitution context2 body type subst2)))
+
+
+;;; Here are some defaults to play around with.
+
+(defparameter *default-type-context* nil)
+
+(defun define-type (term type)
+  (push (cons term (gen-scheme type)) *default-type-context*))
+
 (setq *default-type-context* nil)
-;;; Everything is curried!
 (define-type 'true '(boolean))
 (define-type 'false '(boolean))
-(define-type 'if    '(-> (boolean) (-> a (-> a a))))
+(define-type 'if    '(-> (boolean) (-> a (-> a a))))  ; Everything is curried!
 (define-type 'zero  '(integer))
 (define-type 'succ  '(-> (integer) (integer)))
 (define-type 'empty '(list a))
@@ -104,6 +234,14 @@ substitution."
 (define-type 'head  '(-> (list a) a))
 (define-type 'tail '(-> (list a) (list a)))
 (define-type 'fix '(-> a (-> a a)))
+
+
+;;; The front-end.
+
+(defun infer-type (term &optional (context *default-type-context*))
+  (let* ((a (make-type-variable))
+	 (subst (principal-substitution context term a)))
+    (substitute-types subst a)))
 
 
 ;;; Bibliography
